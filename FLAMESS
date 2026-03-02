@@ -1,0 +1,205 @@
+#include <SPI.h>
+#include <LoRa.h>
+#include <DHT.h>
+#include <TinyGPSPlus.h>
+#include <HardwareSerial.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SH110X.h>
+// ================= Pins =================
+#define LORA_SCK   27
+#define LORA_MISO  26
+#define LORA_MOSI  25
+#define LORA_CS    13
+#define LORA_RST   32
+#define LORA_DIO0  14
+
+#define DHTPIN     33
+#define DHTTYPE    DHT11
+
+#define GPS_RX     16
+#define GPS_TX     17
+
+#define I2C_SDA    23
+#define I2C_SCL    22
+#define OLED_ADDR  0x3C
+
+String NODE_ID = "Node2";
+// ================= Objects =================
+DHT dht(DHTPIN, DHTTYPE);
+TinyGPSPlus gps;
+HardwareSerial gpsSerial(2);
+// Added -1 for the reset pin to support your 4-pin module
+Adafruit_SH1106G display(128, 64, &Wire, -1);
+// ================= Timing =================
+unsigned long lastSendTime = 0;
+unsigned long lastOLEDTime = 0;
+unsigned long lastGPSTime  = 0;
+// ================= GPS =================
+double latitude = 0.0;
+double longitude = 0.0;
+bool gpsFixed = false;
+uint8_t satCount = 0;
+// ================= Sensors =================
+float temperature = NAN;
+float humidity = NAN;
+// Placeholder sensors (future use)
+int flameValue = 0;
+int smokeValue = 0;
+// ================= ACK =================
+bool lastAckReceived = false;
+int lastRSSI = 0;
+const unsigned long ACK_WAIT_MS = 1500;
+const int MAX_RETRIES = 3;
+// ================= Packet Identity =================
+uint32_t session_id = 0;   // changes every reboot
+uint32_t seq = 1;          // increments per logical packet
+// ================= Setup =================
+void setup() {
+  Serial.begin(115200);
+  // Generate session ID once per boot
+  randomSeed(esp_random());
+  session_id = esp_random();
+  Wire.begin(I2C_SDA, I2C_SCL);
+  display.begin(OLED_ADDR, true);
+  // CLEAR STATIC FIX: Wipe the screen buffer immediately
+  display.clearDisplay();
+  display.display();
+  display.setTextSize(1);
+  display.setTextColor(SH110X_WHITE);
+
+  dht.begin();
+
+  gpsSerial.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
+  SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_CS);
+  LoRa.setPins(LORA_CS, LORA_RST, LORA_DIO0);
+  if (!LoRa.begin(433E6)) {
+    Serial.println("LoRa init failed");
+    while (1);
+  }
+  LoRa.setSpreadingFactor(12);
+  LoRa.setSignalBandwidth(125E3);
+  LoRa.setCodingRate4(5);
+  LoRa.enableCrc();
+  LoRa.setSyncWord(0x12);
+  LoRa.setTxPower(17);
+  lastSendTime = millis();
+  lastOLEDTime = millis();
+  lastGPSTime  = millis();
+  Serial.println("ESP32 TX with ACK + Retry");
+  Serial.printf("Session ID: %lu\n", session_id);
+
+}
+// ================= Loop =================
+void loop() {
+  // ---- GPS ----
+  while (gpsSerial.available()) gps.encode(gpsSerial.read());
+  if (millis() - lastGPSTime >= 1000) {
+    lastGPSTime = millis();
+    gpsFixed = gps.location.isValid();
+    if (gpsFixed) {
+      latitude = gps.location.lat();
+      longitude = gps.location.lng();
+    }
+    if (gps.satellites.isValid()) satCount = gps.satellites.value();
+  }
+  // ---- SEND EVERY 60s ----
+  if (millis() - lastSendTime >= 60000) {
+    lastSendTime = millis();
+    lastAckReceived = false;
+    lastRSSI = 0;
+
+    temperature = dht.readTemperature();
+    humidity = dht.readHumidity();
+    // Build payload ONCE (same payload for retries)
+    String payload = "{";
+    payload += "\"node\":\"" + NODE_ID + "\",";
+    payload += "\"session\":" + String(session_id) + ",";
+    payload += "\"seq\":" + String(seq) + ",";
+    payload += "\"temp\":" + String(temperature, 1) + ",";
+    payload += "\"hum\":" + String(humidity, 1) + ",";
+    payload += "\"lat\":" + (gpsFixed ? String(latitude, 4) : "null") + ",";
+    payload += "\"lon\":" + (gpsFixed ? String(longitude, 4) : "null") + ",";
+    payload += "\"flame\":" + String(flameValue) + ",";
+    payload += "\"smoke\":" + String(smokeValue);
+    payload += "}";
+
+    Serial.println("TX payload: " + payload);
+    // ---- RETRY LOOP ----
+    for (int attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+      Serial.printf("TX attempt %d\n", attempt);
+      LoRa.beginPacket();
+      LoRa.print(payload);
+      LoRa.endPacket();
+      // Listen for ACK
+      LoRa.idle();
+      delay(5);
+      LoRa.receive();
+      unsigned long t0 = millis();
+
+      while (millis() - t0 < ACK_WAIT_MS) {
+        int packetSize = LoRa.parsePacket();
+        if (packetSize) {
+          String ack = "";
+          while (LoRa.available()) ack += (char)LoRa.read();
+          if (ack == "ACK:" + NODE_ID) {
+            lastAckReceived = true;
+            lastRSSI = LoRa.packetRssi();
+            Serial.println("ACK RECEIVED RSSI=" + String(lastRSSI));
+          }
+          break;
+
+        }
+        delay(2);
+      }
+      LoRa.idle();
+      if (lastAckReceived) break;
+      Serial.println("No ACK, retrying...");
+      delay(200);  // small backoff
+    }
+    if (lastAckReceived) {
+      Serial.println("Packet delivered successfully");
+    } else {
+      Serial.println("Packet lost after retries");
+    }
+    // Increment sequence ONCE per logical packet
+    seq++;
+  }
+  // ---- OLED (1 Hz) ----
+  if (millis() - lastOLEDTime >= 1000) {
+    lastOLEDTime = millis();
+    unsigned long txAge = (millis() - lastSendTime) / 1000;
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.println("Node: " + NODE_ID);
+    display.print("S:");
+    display.print(session_id);
+    display.print(" Q:");
+    display.println(seq);
+
+    display.print("GPS:");
+    display.print(gpsFixed ? "FIX " : "NO ");
+    display.print("Sat:");
+    display.println(satCount);
+
+    display.print("Lat:");
+    gpsFixed ? display.println(latitude, 4) : display.println("----");
+    display.print("Lon:");
+    gpsFixed ? display.println(longitude, 4) : display.println("----");
+
+    display.print("T:");
+    isnan(temperature) ? display.print("--") : display.print(temperature, 1);
+    display.print("C H:");
+    isnan(humidity) ? display.print("--") : display.print(humidity, 1);
+    display.println("%");
+
+    display.print("TX:");
+    display.print(txAge);
+    display.print("s ");
+    display.print(lastAckReceived ? "ACK " : "NO ");
+    display.print("R:");
+    display.println(lastAckReceived ? lastRSSI : 0);
+
+    display.display();
+  }
+}
